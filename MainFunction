@@ -1,0 +1,1608 @@
+# ====================================================================================
+# MobileNetV2 Bottleneck-Aware Distillation (CIFAR-100) — 2 Seeds, 20 Epochs, Full Plots
+# ====================================================================================
+
+# =========================================================
+# Part 0 — CONFIG
+# =========================================================
+CONFIG = {
+    # Seeds
+    "seeds": [0, 1],
+    "split_seed": 123,     # fixed train/val split
+    "ablation_seed": 0,
+
+    # Data
+    "num_classes": 100,
+    "input_size": (96, 96),
+    "batch_size": 256,
+    "buffer_size": 20_000,
+    "val_frac": 0.1,
+
+    # Epochs (constraints)
+    "teacher_epochs": 20,
+    "student_epochs": 20,
+
+    # Optimization (constant LR)
+    "base_lr": 3e-4,
+    "weight_decay": 1e-4,
+    "clipnorm": 1.0,
+
+    # KD (logits)
+    "temperature": 4.0,
+    "alpha_kd": 0.5,
+    "alpha_warmup_frac": 0.30,  # warmup alpha: 0 -> alpha_kd
+
+    # Proposed (feature KD)
+    "beta_max": 30.0,
+    "beta_warmup_frac": 0.30,  # warmup beta: 0 -> beta_max
+
+    # Taps
+    "tap_mode": "late",
+    "num_taps": 2,
+
+    # Feature KD
+    "adapters_on": True,
+    "feat_loss_type": "norm_mse",  # "norm_mse" | "mse"
+
+    # Initialization
+    "student_imagenet_init": True,
+    "teacher_imagenet_init": True,
+    "feature_teacher_imagenet_init": True,
+
+    # Optional: try a wider feature teacher; fall back safely if weights unavailable
+    "feature_teacher_alpha_try": 1.4,
+    "student_alpha": 1.0,
+
+    # Stability
+    "freeze_student_bn": False,
+
+    # Calibration / ECE
+    "ece_bins": 15,
+
+    # Artifacts
+    "results_dir": "./results_kd",
+    "cache_teacher_weights": True,
+    "teacher_weights_name": "teacher_resnet50_logits_headonly_best.weights.h5",
+
+    # Latency micro-benchmark
+    "latency_device": "CPU",     # "CPU" or "DEFAULT"
+    "lat_batch_size": 1,
+    "lat_warmup": 30,
+    "lat_iters_student": 120,
+    "lat_iters_teacher": 60,
+
+    # Ablations
+    "run_ablations": True,
+
+    # Save artifacts
+    "save_plots": True,
+    "save_tables": True,
+    "zip_artifacts": True,
+}
+
+# =========================================================
+# Part 1 — Imports + Strategy + Precision
+# =========================================================
+import os
+import re
+import time
+import random
+import shutil
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+!pip -q install --upgrade tensorflow
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+os.makedirs(CONFIG["results_dir"], exist_ok=True)
+tf.keras.backend.clear_session()
+
+
+def setup_tpu_or_default():
+    try:
+        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(resolver)
+        tf.tpu.experimental.initialize_tpu_system(resolver)
+        strategy = tf.distribute.TPUStrategy(resolver)
+        print("Strategy: TPUStrategy")
+        return strategy
+    except Exception:
+        strategy = tf.distribute.get_strategy()
+        print(f"Strategy: {strategy.__class__.__name__}")
+        return strategy
+
+
+STRATEGY = setup_tpu_or_default()
+
+
+def set_mixed_precision():
+    try:
+        tpus = tf.config.list_logical_devices("TPU")
+        gpus = tf.config.list_logical_devices("GPU")
+        if len(tpus) > 0:
+            keras.mixed_precision.set_global_policy("mixed_bfloat16")
+            print("Mixed Precision Policy: MixedBfloat16")
+        elif len(gpus) > 0:
+            keras.mixed_precision.set_global_policy("mixed_float16")
+            print("Mixed Precision Policy: MixedFloat16")
+        else:
+            keras.mixed_precision.set_global_policy("float32")
+            print("Mixed Precision Policy: Float32")
+    except Exception as e:
+        print("Mixed Precision Setup Skipped:", e)
+
+
+set_mixed_precision()
+
+
+def slugify(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+
+def fig_path(name: str) -> str:
+    return os.path.join(CONFIG["results_dir"], f"{slugify(name)}.png")
+
+
+def table_path(name: str) -> str:
+    return os.path.join(CONFIG["results_dir"], f"{slugify(name)}.csv")
+
+
+def save_current_fig(title_for_name: str):
+    if not CONFIG["save_plots"]:
+        return
+    p = fig_path(title_for_name)
+    plt.savefig(p, dpi=200, bbox_inches="tight")
+    print(f"[Saved Figure] {p}")
+
+
+def save_df(df: pd.DataFrame, name: str):
+    if not CONFIG["save_tables"]:
+        return
+    p = table_path(name)
+    df.to_csv(p, index=False)
+    print(f"[Saved Table] {p}")
+
+
+def set_global_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+
+
+def make_optimizer():
+    lr = CONFIG["base_lr"]
+    wd = CONFIG["weight_decay"]
+    try:
+        return keras.optimizers.AdamW(
+            learning_rate=lr,
+            weight_decay=wd,
+            clipnorm=CONFIG["clipnorm"],
+        )
+    except Exception:
+        return keras.optimizers.Adam(
+            learning_rate=lr,
+            clipnorm=CONFIG["clipnorm"],
+        )
+
+
+def weights_path(tag: str):
+    return os.path.join(CONFIG["results_dir"], f"{tag}.weights.h5")
+
+
+def describe_model(model, role: str):
+    try:
+        total = int(model.count_params())
+    except Exception:
+        total = -1
+    trainable = int(np.sum([np.prod(v.shape) for v in model.trainable_variables]))
+    print(f"{role}: name={model.name} | params={total:,} | trainable_params={trainable:,}")
+
+
+class TimeHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs=None):
+        self.times = []
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._t0 = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.times.append(time.time() - self._t0)
+
+
+class LRLogToHistory(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None:
+            return
+        opt = getattr(self.model, "optimizer", None)
+        if opt is None:
+            return
+        try:
+            logs["learning_rate"] = float(tf.keras.backend.get_value(opt.learning_rate))
+        except Exception:
+            pass
+
+
+class EpochSetter(tf.keras.callbacks.Callback):
+    """Sets model.epoch_var each epoch (for alpha/beta warmup in distillers)."""
+    def on_epoch_begin(self, epoch, logs=None):
+        if hasattr(self.model, "epoch_var") and isinstance(self.model.epoch_var, tf.Variable):
+            self.model.epoch_var.assign(epoch)
+
+
+class BestStudentSaver(tf.keras.callbacks.Callback):
+    """Save BEST-val student weights (works for Baseline / Control / Proposed)."""
+    def __init__(self, student_model, path, monitor="val_acc", mode="max"):
+        super().__init__()
+        self.student_model = student_model
+        self.path = path
+        self.monitor = monitor
+        self.mode = mode
+        self.best = -np.inf if mode == "max" else np.inf
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None or self.monitor not in logs:
+            return
+        val = float(logs[self.monitor])
+        improved = (val > self.best) if self.mode == "max" else (val < self.best)
+        if improved:
+            self.best = val
+            self.student_model.save_weights(self.path)
+            print(f"[BestStudentSaver] Epoch={epoch+1} {self.monitor}={val:.4f} -> Saved: {self.path}")
+
+
+# =========================================================
+# Part 2 — Data Pipeline (Fixed Split Across Seeds)
+# =========================================================
+def load_cifar100():
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar100.load_data(label_mode="fine")
+    return (x_train, y_train.squeeze().astype(np.int32)), (x_test, y_test.squeeze().astype(np.int32))
+
+
+def preprocess_and_resize(image, label, training: bool):
+    image = tf.cast(image, tf.float32)
+    image = tf.image.resize(image, CONFIG["input_size"], method="bilinear")
+    if training:
+        image = tf.image.random_flip_left_right(image)
+        pad = 8
+        image = tf.image.resize_with_crop_or_pad(
+            image, CONFIG["input_size"][0] + pad, CONFIG["input_size"][1] + pad
+        )
+        image = tf.image.random_crop(image, size=(CONFIG["input_size"][0], CONFIG["input_size"][1], 3))
+    return image, label
+
+
+_FIXED_SPLIT = None
+
+
+def make_fixed_split_indices(n, split_seed, val_frac):
+    rng = np.random.default_rng(split_seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    val_size = int(val_frac * n)
+    trn_idx = idx[val_size:]
+    val_idx = idx[:val_size]
+    return trn_idx, val_idx
+
+
+def make_datasets(run_seed: int):
+    global _FIXED_SPLIT
+    (x_train, y_train), (x_test, y_test) = load_cifar100()
+
+    if _FIXED_SPLIT is None:
+        trn_idx, val_idx = make_fixed_split_indices(len(x_train), CONFIG["split_seed"], CONFIG["val_frac"])
+        _FIXED_SPLIT = (trn_idx, val_idx)
+    else:
+        trn_idx, val_idx = _FIXED_SPLIT
+
+    x_trn, y_trn = x_train[trn_idx], y_train[trn_idx]
+    x_val, y_val = x_train[val_idx], y_train[val_idx]
+
+    options = tf.data.Options()
+    options.experimental_deterministic = False
+
+    def ds_from_numpy(x, y, training: bool):
+        ds = tf.data.Dataset.from_tensor_slices((x, y))
+        if training:
+            ds = ds.shuffle(CONFIG["buffer_size"], seed=run_seed, reshuffle_each_iteration=True)
+        ds = ds.map(lambda im, lab: preprocess_and_resize(im, lab, training),
+                    num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(CONFIG["batch_size"], drop_remainder=training).with_options(options)
+        ds = ds.prefetch(tf.data.AUTOTUNE)
+        return ds
+
+    return ds_from_numpy(x_trn, y_trn, True), ds_from_numpy(x_val, y_val, False), ds_from_numpy(x_test, y_test, False)
+
+
+# =========================================================
+# Part 3 — Taps + Model Builders
+# =========================================================
+def choose_mobilenetv2_bottleneck_taps(backbone: keras.Model, mode: str, num_taps: int):
+    candidates = [l.name for l in backbone.layers if l.name.endswith("project_BN")]
+    if not candidates:
+        raise RuntimeError("No MobileNetV2 '*project_BN' layers found.")
+
+    def pick(frac: float) -> str:
+        idx = int(frac * (len(candidates) - 1))
+        idx = max(0, min(idx, len(candidates) - 1))
+        return candidates[idx]
+
+    if mode == "late":
+        taps = [pick(0.85), pick(0.95)]
+    elif mode == "mixed":
+        taps = [pick(0.50), pick(0.90)]
+    elif mode == "early":
+        taps = [pick(0.20), pick(0.35)]
+    else:
+        raise ValueError("Tap Mode Must Be 'early' | 'mixed' | 'late'.")
+
+    return taps[:num_taps]
+
+
+def build_resnet50_logits_teacher(num_classes: int):
+    weights = "imagenet" if CONFIG["teacher_imagenet_init"] else None
+    backbone = keras.applications.ResNet50(
+        include_top=False,
+        weights=weights,
+        input_shape=(*CONFIG["input_size"], 3),
+    )
+    backbone.trainable = False  # head-only for speed
+
+    inputs = keras.Input(shape=(*CONFIG["input_size"], 3))
+    x = keras.applications.resnet.preprocess_input(inputs)
+    feat = backbone(x, training=False)
+    x = layers.GlobalAveragePooling2D()(feat)
+    x = layers.Dense(512, activation="relu")(x)
+    logits = layers.Dense(num_classes, name="logits", dtype="float32")(x)
+    return keras.Model(inputs, logits, name="teacher_resnet50_logits")
+
+
+class StudentTapModel(tf.keras.Model):
+    """
+    Subclassed Student Model that propagates `training` to backbone.
+    (This block is indentation-safe: 4 spaces everywhere.)
+    """
+    def __init__(self, num_classes: int, tap_layer_names, imagenet_init: bool, alpha: float, freeze_bn: bool):
+        super().__init__(name="student_mobilenetv2_taps")
+
+        weights = "imagenet" if imagenet_init else None
+        backbone = keras.applications.MobileNetV2(
+            include_top=False,
+            weights=weights,
+            input_shape=(*CONFIG["input_size"], 3),
+            alpha=float(alpha),
+        )
+
+        if freeze_bn:
+            for layer in backbone.layers:
+                if isinstance(layer, tf.keras.layers.BatchNormalization):
+                    layer.trainable = False
+
+        tap_outputs = [backbone.get_layer(n).output for n in tap_layer_names]
+        self.feat_extractor = keras.Model(
+            backbone.input,
+            [backbone.output] + tap_outputs,
+            name="student_feature_extractor",
+        )
+
+        self.pool = layers.GlobalAveragePooling2D()
+        self.drop = layers.Dropout(0.2)
+        self.fc = layers.Dense(num_classes, name="student_logits", dtype="float32")
+
+    def call(self, inputs, training=False):
+        x = inputs / 127.5 - 1.0
+        outs = self.feat_extractor(x, training=training)
+        backbone_feat = outs[0]
+        taps = outs[1:]
+        z = self.pool(backbone_feat)
+        z = self.drop(z, training=training)
+        logits = self.fc(z)
+        return [logits] + list(taps)
+
+
+class StudentLogitsOnly(tf.keras.Model):
+    def __init__(self, student_tap: StudentTapModel):
+        super().__init__(name="student_logits_only")
+        self.student_tap = student_tap
+
+    def call(self, inputs, training=False):
+        return self.student_tap(inputs, training=training)[0]
+
+
+def build_mobilenetv2_feature_teacher(tap_layer_names):
+    weights = "imagenet" if CONFIG["feature_teacher_imagenet_init"] else None
+    alpha_try = float(CONFIG["feature_teacher_alpha_try"])
+
+    backbone = None
+    for alpha in [alpha_try, 1.0]:
+        try:
+            backbone = keras.applications.MobileNetV2(
+                include_top=False,
+                weights=weights,
+                input_shape=(*CONFIG["input_size"], 3),
+                alpha=float(alpha),
+            )
+            print(f"Feature Teacher MobileNetV2 Alpha: {alpha}")
+            break
+        except Exception:
+            backbone = None
+
+    if backbone is None:
+        backbone = keras.applications.MobileNetV2(
+            include_top=False,
+            weights=None,
+            input_shape=(*CONFIG["input_size"], 3),
+            alpha=1.0,
+        )
+        print("Feature Teacher MobileNetV2 Alpha: 1.0 (No ImageNet Weights)")
+
+    backbone.trainable = False
+    tap_outputs = [backbone.get_layer(n).output for n in tap_layer_names]
+    extractor = keras.Model(backbone.input, tap_outputs, name="feature_teacher_extractor")
+
+    inputs = keras.Input(shape=(*CONFIG["input_size"], 3))
+    x = inputs / 127.5 - 1.0
+    taps = extractor(x, training=False)
+    return keras.Model(inputs, taps, name="feature_teacher_mobilenetv2_taps")
+
+
+# =========================================================
+# Part 4 — Losses + Distillers
+# =========================================================
+ce_loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+
+def kd_kl_loss(teacher_logits, student_logits, temperature: float):
+    t = float(temperature)
+    p_t = tf.nn.softmax(teacher_logits / t, axis=-1)
+    p_s = tf.nn.softmax(student_logits / t, axis=-1)
+    kl = tf.keras.losses.KLDivergence()(p_t, p_s)
+    return kl * (t ** 2)
+
+
+def mse_loss(t_feat, s_feat):
+    return tf.reduce_mean(tf.square(t_feat - s_feat))
+
+
+def norm_mse_loss(t_feat, s_feat):
+    t = tf.nn.l2_normalize(t_feat, axis=-1)
+    s = tf.nn.l2_normalize(s_feat, axis=-1)
+    return tf.reduce_mean(tf.square(t - s))
+
+
+class LogitsKDDistiller(keras.Model):
+    def __init__(self, student_logits_model, teacher_logits_model, temperature: float, alpha_max: float, warmup_epochs: int):
+        super().__init__(name="logits_kd_distiller")
+        self.student = student_logits_model
+        self.teacher = teacher_logits_model
+        self.temperature = float(temperature)
+        self.alpha_max = tf.constant(float(alpha_max), dtype=tf.float32)
+        self.warmup_epochs = int(max(1, warmup_epochs))
+        self.epoch_var = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch_var")
+        self.acc = keras.metrics.SparseCategoricalAccuracy(name="acc")
+
+    @property
+    def metrics(self):
+        return [self.acc]
+
+    def compile(self, optimizer):
+        super().compile(optimizer=optimizer)
+        self.optimizer = optimizer
+
+    def _alpha_t(self):
+        e = tf.cast(self.epoch_var + 1, tf.float32)
+        w = tf.cast(self.warmup_epochs, tf.float32)
+        frac = tf.minimum(1.0, e / w)
+        return self.alpha_max * frac
+
+    @tf.function
+    def train_step(self, data):
+        x, y = data
+        t_logits = tf.stop_gradient(self.teacher(x, training=False))
+        with tf.GradientTape() as tape:
+            s_logits = self.student(x, training=True)
+            ce = ce_loss_fn(y, s_logits)
+            kd = kd_kl_loss(t_logits, s_logits, self.temperature)
+            a = self._alpha_t()
+            loss = (1.0 - a) * ce + a * kd
+        grads = tape.gradient(loss, self.student.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.student.trainable_variables))
+        self.acc.update_state(y, tf.nn.softmax(s_logits))
+        return {"loss": loss, "acc": self.acc.result(), "ce": ce, "kd": kd, "alpha_t": a}
+
+    @tf.function
+    def test_step(self, data):
+        x, y = data
+        s_logits = self.student(x, training=False)
+        nll = ce_loss_fn(y, s_logits)
+        self.acc.update_state(y, tf.nn.softmax(s_logits))
+        return {"loss": nll, "acc": self.acc.result()}
+
+
+class DualTeacherBottleneckDistiller(keras.Model):
+    def __init__(
+        self,
+        student_tap: StudentTapModel,
+        logits_teacher,
+        feat_teacher_taps,
+        temperature: float,
+        alpha_max: float,
+        alpha_warmup_epochs: int,
+        beta_max: float,
+        beta_warmup_epochs: int,
+        adapters_on: bool,
+        feat_loss_type: str,
+    ):
+        super().__init__(name="dual_teacher_bottleneck_distiller")
+
+        self.student_tap = student_tap
+        self.student_logits = StudentLogitsOnly(student_tap)
+
+        self.logits_teacher = logits_teacher
+        self.feat_teacher = feat_teacher_taps
+
+        self.temperature = float(temperature)
+
+        self.alpha_max = tf.constant(float(alpha_max), dtype=tf.float32)
+        self.alpha_warmup_epochs = int(max(1, alpha_warmup_epochs))
+
+        self.beta_max = tf.constant(float(beta_max), dtype=tf.float32)
+        self.beta_warmup_epochs = int(max(1, beta_warmup_epochs))
+
+        self.adapters_on = bool(adapters_on)
+        self.feat_loss_type = str(feat_loss_type)
+
+        self.epoch_var = tf.Variable(0, dtype=tf.int32, trainable=False, name="epoch_var")
+
+        self.adapters = []
+        if self.adapters_on:
+            dummy = tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32)
+            t_taps = self.feat_teacher(dummy, training=False)
+            for i, t in enumerate(t_taps):
+                ch = int(t.shape[-1])
+                self.adapters.append(layers.Conv2D(ch, 1, padding="same", name=f"adapter_{i}"))
+
+        self.acc = keras.metrics.SparseCategoricalAccuracy(name="acc")
+        self._train_vars = None
+
+    @property
+    def metrics(self):
+        return [self.acc]
+
+    def compile(self, optimizer):
+        super().compile(optimizer=optimizer)
+        self.optimizer = optimizer
+
+        dummy = tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32)
+        s_out = self.student_tap(dummy, training=False)
+        _ = self.logits_teacher(dummy, training=False)
+        _ = self.feat_teacher(dummy, training=False)
+
+        if self.adapters_on:
+            s_feats = s_out[1:]
+            for i, ad in enumerate(self.adapters):
+                _ = ad(s_feats[i])
+
+        self._train_vars = list(self.student_tap.trainable_variables)
+        if self.adapters_on:
+            self._train_vars += [v for ad in self.adapters for v in ad.trainable_variables]
+
+        if hasattr(self.optimizer, "build"):
+            self.optimizer.build(self._train_vars)
+
+    def _alpha_t(self):
+        e = tf.cast(self.epoch_var + 1, tf.float32)
+        w = tf.cast(self.alpha_warmup_epochs, tf.float32)
+        frac = tf.minimum(1.0, e / w)
+        return self.alpha_max * frac
+
+    def _beta_t(self):
+        e = tf.cast(self.epoch_var + 1, tf.float32)
+        w = tf.cast(self.beta_warmup_epochs, tf.float32)
+        frac = tf.minimum(1.0, e / w)
+        return self.beta_max * frac
+
+    def _feat_loss(self, t_feat, s_feat):
+        if self.feat_loss_type == "mse":
+            return mse_loss(t_feat, s_feat)
+        return norm_mse_loss(t_feat, s_feat)
+
+    @tf.function
+    def train_step(self, data):
+        x, y = data
+        t_logits = tf.stop_gradient(self.logits_teacher(x, training=False))
+        t_feats = [tf.stop_gradient(f) for f in self.feat_teacher(x, training=False)]
+
+        with tf.GradientTape() as tape:
+            s_out = self.student_tap(x, training=True)
+            s_logits = s_out[0]
+            s_feats = s_out[1:]
+
+            ce = ce_loss_fn(y, s_logits)
+            kd = kd_kl_loss(t_logits, s_logits, self.temperature)
+
+            feat_losses = []
+            for i, (tfm, sfm) in enumerate(zip(t_feats, s_feats)):
+                if tf.shape(tfm)[1] != tf.shape(sfm)[1] or tf.shape(tfm)[2] != tf.shape(sfm)[2]:
+                    tfm = tf.image.resize(tfm, (tf.shape(sfm)[1], tf.shape(sfm)[2]), method="bilinear")
+
+                sfm_use = sfm
+                if self.adapters_on:
+                    sfm_use = self.adapters[i](sfm)
+                else:
+                    ct = tf.shape(tfm)[-1]
+                    cs = tf.shape(sfm_use)[-1]
+                    cmin = tf.minimum(ct, cs)
+                    tfm = tfm[..., :cmin]
+                    sfm_use = sfm_use[..., :cmin]
+
+                feat_losses.append(self._feat_loss(tfm, sfm_use))
+
+            feat = tf.add_n(feat_losses) / tf.cast(len(feat_losses), tf.float32)
+
+            a = self._alpha_t()
+            b = self._beta_t()
+            loss = (1.0 - a) * ce + a * kd + b * feat
+
+        grads = tape.gradient(loss, self._train_vars)
+        self.optimizer.apply_gradients(zip(grads, self._train_vars))
+        self.acc.update_state(y, tf.nn.softmax(s_logits))
+        return {"loss": loss, "acc": self.acc.result(), "ce": ce, "kd": kd, "feat": feat, "alpha_t": a, "beta_t": b}
+
+    @tf.function
+    def test_step(self, data):
+        x, y = data
+        s_logits = self.student_logits(x, training=False)
+        nll = ce_loss_fn(y, s_logits)
+        self.acc.update_state(y, tf.nn.softmax(s_logits))
+        return {"loss": nll, "acc": self.acc.result()}
+
+
+# =========================================================
+# Part 5 — Evaluation + Calibration + Latency
+# =========================================================
+def eval_test_metrics(student_logits_model, test_ds):
+    top1 = keras.metrics.SparseCategoricalAccuracy()
+    top5 = keras.metrics.SparseTopKCategoricalAccuracy(k=5)
+    nll_sum, n = 0.0, 0
+    for x, y in test_ds:
+        logits = student_logits_model(x, training=False)
+        probs = tf.nn.softmax(logits)
+        top1.update_state(y, probs)
+        top5.update_state(y, probs)
+        nll = ce_loss_fn(y, logits)
+        bs = int(y.shape[0])
+        nll_sum += float(nll.numpy()) * bs
+        n += bs
+    return float(top1.result().numpy()), float(top5.result().numpy()), float(nll_sum / max(1, n))
+
+
+def collect_logits_and_labels(model_logits, ds):
+    y_true, logits_all = [], []
+    for x, y in ds:
+        logits = model_logits(x, training=False)
+        y_true.append(y.numpy())
+        logits_all.append(logits.numpy())
+    return np.concatenate(y_true), np.concatenate(logits_all)
+
+
+def softmax_np(logits):
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(logits)
+    return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+def reliability_bins(y_true, probs, n_bins: int):
+    preds = np.argmax(probs, axis=1)
+    conf = np.max(probs, axis=1)
+    acc = (preds == y_true).astype(np.float32)
+
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_acc, bin_conf, bin_frac = [], [], []
+
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        idx = np.where((conf > lo) & (conf <= hi))[0]
+        if len(idx) == 0:
+            bin_acc.append(0.0)
+            bin_conf.append(0.0)
+            bin_frac.append(0.0)
+        else:
+            bin_acc.append(float(np.mean(acc[idx])))
+            bin_conf.append(float(np.mean(conf[idx])))
+            bin_frac.append(float(len(idx) / len(y_true)))
+
+    return np.array(bin_acc), np.array(bin_conf), np.array(bin_frac)
+
+
+def ece_from_bins(bin_acc, bin_conf, bin_frac):
+    return float(np.sum(bin_frac * np.abs(bin_acc - bin_conf)))
+
+
+def count_params(model):
+    return int(model.count_params())
+
+
+def benchmark_latency_ms(model, device_mode: str, batch_size: int, warmup: int, iters: int):
+    x = tf.random.uniform((batch_size, *CONFIG["input_size"], 3), dtype=tf.float32)
+
+    @tf.function
+    def f(inp):
+        return model(inp, training=False)
+
+    dev = "/CPU:0" if device_mode.upper() == "CPU" else None
+
+    if dev is None:
+        for _ in range(warmup):
+            _ = f(x)
+    else:
+        with tf.device(dev):
+            x_cpu = tf.identity(x)
+            for _ in range(warmup):
+                _ = f(x_cpu)
+
+    t0 = time.perf_counter()
+    if dev is None:
+        for _ in range(iters):
+            _ = f(x)
+    else:
+        with tf.device(dev):
+            x_cpu = tf.identity(x)
+            for _ in range(iters):
+                _ = f(x_cpu)
+    t1 = time.perf_counter()
+
+    ms_per_iter = (t1 - t0) * 1000.0 / float(iters)
+    return float(ms_per_iter / float(batch_size))
+
+
+# =========================================================
+# Part 6 — Plotting (colors + saving)
+# =========================================================
+METHOD_ORDER = ["baseline", "control", "proposed"]
+METHOD_LABEL = {
+    "baseline": "Baseline (Cross-Entropy)",
+    "control": "Control (Logits-Only Distillation)",
+    "proposed": "Proposed (Dual-Teacher Distillation)",
+}
+
+# Method colors everywhere
+METHOD_COLOR = {
+    "baseline": "tab:orange",  # baseline = orange
+    "control": "tab:blue",     # control  = blue
+    "proposed": "tab:green",   # proposed = green
+}
+
+# Metric colors only where bars represent different metrics
+METRIC_COLOR = {
+    "top1": "tab:purple",
+    "top5": "tab:blue",
+    "lat": "tab:purple",
+    "acc": "tab:blue",
+}
+
+
+def plot_validation_accuracy_by_seed(hist_by_method_seed, seed: int):
+    plt.figure(figsize=(7, 5))
+    for m in METHOD_ORDER:
+        h = hist_by_method_seed[m][seed]
+        plt.plot(np.arange(1, len(h["val_acc"]) + 1), h["val_acc"],
+                 label=METHOD_LABEL[m], color=METHOD_COLOR[m])
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (Top-1)")
+    title = f"Validation Accuracy Vs Epoch (Seed {seed})"
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_validation_nll_by_seed(hist_by_method_seed, seed: int):
+    plt.figure(figsize=(7, 5))
+    for m in METHOD_ORDER:
+        h = hist_by_method_seed[m][seed]
+        plt.plot(np.arange(1, len(h["val_loss"]) + 1), h["val_loss"],
+                 label=METHOD_LABEL[m], color=METHOD_COLOR[m])
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Negative Log-Likelihood")
+    title = f"Validation Negative Log-Likelihood Vs Epoch (Seed {seed})"
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_convergence_speed_by_seed(hist_by_method_seed, times_by_method_seed, seed: int):
+    plt.figure(figsize=(7, 5))
+    for m in METHOD_ORDER:
+        vals = np.array(hist_by_method_seed[m][seed]["val_acc"], dtype=np.float32)
+        t = np.cumsum(np.array(times_by_method_seed[m][seed], dtype=np.float32)) / 60.0
+        n = min(len(vals), len(t))
+        plt.plot(t[:n], vals[:n], label=METHOD_LABEL[m], color=METHOD_COLOR[m])
+    plt.xlabel("Cumulative Training Time (Minutes)")
+    plt.ylabel("Validation Accuracy (Top-1)")
+    title = f"Training Efficiency: Validation Accuracy Vs Time (Seed {seed})"
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_test_accuracy_bars_by_seed(test_df, seed: int):
+    # Per your request: Top-1 purple, Top-5 blue (only here)
+    sub = test_df[test_df["seed"] == seed].set_index("method")
+    top1 = [float(sub.loc[m, "top1"]) for m in METHOD_ORDER]
+    top5 = [float(sub.loc[m, "top5"]) for m in METHOD_ORDER]
+
+    x = np.arange(len(METHOD_ORDER))
+    w = 0.35
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x - w / 2, top1, width=w, label="Top-1 Accuracy", color=METRIC_COLOR["top1"])
+    plt.bar(x + w / 2, top5, width=w, label="Top-5 Accuracy", color=METRIC_COLOR["top5"])
+    plt.xticks(x, [METHOD_LABEL[m] for m in METHOD_ORDER], rotation=10)
+    plt.ylabel("Test Accuracy")
+    title = f"Test Accuracy (Best Checkpoints, Seed {seed})"
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_test_nll_bars_by_seed(test_df, seed: int):
+    # One bar per method -> method colors
+    sub = test_df[test_df["seed"] == seed].set_index("method")
+    nll = [float(sub.loc[m, "nll"]) for m in METHOD_ORDER]
+    x = np.arange(len(METHOD_ORDER))
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x, nll, color=[METHOD_COLOR[m] for m in METHOD_ORDER])
+    plt.xticks(x, [METHOD_LABEL[m] for m in METHOD_ORDER], rotation=10)
+    plt.ylabel("Test Negative Log-Likelihood")
+    title = f"Test Negative Log-Likelihood (Best Checkpoints, Seed {seed})"
+    plt.title(title)
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_val_acc_mean_std(hist_by_method_seed):
+    plt.figure(figsize=(9, 5))
+    epochs = np.arange(1, CONFIG["student_epochs"] + 1)
+
+    for m in METHOD_ORDER:
+        curves = [np.array(hist_by_method_seed[m][s]["val_acc"], dtype=np.float32) for s in CONFIG["seeds"]]
+        curves = np.stack(curves, axis=0)
+        mean = curves.mean(axis=0)
+        std = curves.std(axis=0, ddof=0)
+        plt.plot(epochs, mean, label=f"{METHOD_LABEL[m]} (Mean)", color=METHOD_COLOR[m])
+        plt.fill_between(epochs, mean - std, mean + std, alpha=0.2, color=METHOD_COLOR[m])
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (Top-1)")
+    title = "Validation Accuracy Vs Epoch (Mean ± Std Across Seeds)"
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_val_acc_vs_time_mean_std(hist_by_method_seed, times_by_method_seed):
+    plt.figure(figsize=(9, 5))
+
+    for m in METHOD_ORDER:
+        seed_pairs = []
+        for s in CONFIG["seeds"]:
+            acc = np.array(hist_by_method_seed[m][s]["val_acc"], dtype=np.float32)
+            t = np.cumsum(np.array(times_by_method_seed[m][s], dtype=np.float32)) / 60.0
+            n = min(len(acc), len(t))
+            seed_pairs.append((t[:n], acc[:n]))
+
+        t_max = min(float(tp[0][-1]) for tp in seed_pairs)
+        grid = np.linspace(0.0, t_max, 120)
+
+        interp_acc = [np.interp(grid, t, a) for (t, a) in seed_pairs]
+        interp_acc = np.stack(interp_acc, axis=0)
+
+        mean = interp_acc.mean(axis=0)
+        std = interp_acc.std(axis=0, ddof=0)
+
+        plt.plot(grid, mean, label=f"{METHOD_LABEL[m]} (Mean)", color=METHOD_COLOR[m])
+        plt.fill_between(grid, mean - std, mean + std, alpha=0.2, color=METHOD_COLOR[m])
+
+    plt.xlabel("Cumulative Training Time (Minutes)")
+    plt.ylabel("Validation Accuracy (Top-1)")
+    title = "Training Efficiency: Validation Accuracy Vs Time (Mean ± Std, Interpolated)"
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_test_accuracy_mean_std(test_df):
+    # IMPORTANT: you said keep this one as-is (no recolor changes)
+    means1, std1, means5, std5 = [], [], [], []
+    labels = [METHOD_LABEL[m] for m in METHOD_ORDER]
+
+    for m in METHOD_ORDER:
+        sub = test_df[test_df["method"] == m]
+        means1.append(float(sub["top1"].mean()))
+        std1.append(float(sub["top1"].std(ddof=0)))
+        means5.append(float(sub["top5"].mean()))
+        std5.append(float(sub["top5"].std(ddof=0)))
+
+    x = np.arange(len(METHOD_ORDER))
+    w = 0.35
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(x - w / 2, means1, width=w, yerr=std1, capsize=4, label="Top-1 (Mean ± Std)")
+    plt.bar(x + w / 2, means5, width=w, yerr=std5, capsize=4, label="Top-5 (Mean ± Std)")
+    plt.xticks(x, labels, rotation=10)
+    plt.ylabel("Test Accuracy")
+    title = "Test Accuracy Across Seeds (Mean ± Std)"
+    plt.title(title)
+    plt.grid(True, axis="y")
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_calibration_curve_and_print_ece(calib_by_method_seed):
+    plt.figure(figsize=(6.5, 6.5))
+    plt.plot([0, 1], [0, 1], linewidth=1)
+
+    rows = []
+    for m in METHOD_ORDER:
+        runs = calib_by_method_seed[m]
+        accs = np.stack([r["bin_acc"] for r in runs], axis=0)
+        confs = np.stack([r["bin_conf"] for r in runs], axis=0)
+
+        mean_acc = accs.mean(axis=0)
+        mean_conf = confs.mean(axis=0)
+
+        plt.plot(mean_conf, mean_acc, marker="o", label=METHOD_LABEL[m], color=METHOD_COLOR[m])
+
+        eces = np.array([r["ece"] for r in runs], dtype=np.float32)
+        rows.append({"method": METHOD_LABEL[m], "ECE_mean": float(eces.mean()), "ECE_std": float(eces.std(ddof=0))})
+
+    plt.xlabel("Confidence")
+    plt.ylabel("Accuracy")
+    title = "Calibration Curve (Reliability Diagram) Averaged Across Seeds"
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+    ece_df = pd.DataFrame(rows)
+    print("\nECE (Mean ± Std Across Seeds):")
+    print(ece_df.to_string(index=False))
+    save_df(ece_df, "ece_mean_std")
+
+
+def plot_model_size_bars(pareto_df):
+    plt.figure(figsize=(8, 5))
+    colors = [METHOD_COLOR["baseline"], METHOD_COLOR["control"], METHOD_COLOR["proposed"]]
+    plt.bar(pareto_df["model"].values, pareto_df["params"].values, color=colors)
+    plt.yscale("log")
+    plt.ylabel("Parameters (Log Scale)")
+    title = "Model Size (Parameter Count)"
+    plt.title(title)
+    plt.grid(True, axis="y", which="both")
+    plt.xticks(rotation=10)
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_top1_mean_bars(pareto_df):
+    plt.figure(figsize=(8, 5))
+    colors = [METHOD_COLOR["baseline"], METHOD_COLOR["control"], METHOD_COLOR["proposed"]]
+    plt.bar(pareto_df["model"].values, pareto_df["top1_mean"].values, color=colors)
+    plt.ylabel("Test Top-1 Accuracy (Mean Across Seeds)")
+    title = "Test Top-1 Accuracy (Mean Across Seeds)"
+    plt.title(title)
+    plt.grid(True, axis="y")
+    plt.xticks(rotation=10)
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_pareto_scatter_params(pareto_df):
+    plt.figure(figsize=(8, 6))
+    # Keep points in baseline/control/proposed order
+    xs = pareto_df["params"].values.astype(float)
+    ys = pareto_df["top1_mean"].values.astype(float)
+    labels = ["baseline", "control", "proposed"]
+    for i, m in enumerate(labels):
+        plt.scatter(xs[i], ys[i], s=60, color=METHOD_COLOR[m], label=METHOD_LABEL[m])
+        plt.text(xs[i] * 1.01, ys[i], m, fontsize=10)
+
+    plt.xscale("log")
+    plt.xlabel("Parameters (Log Scale)")
+    plt.ylabel("Test Top-1 Accuracy (Mean Over Seeds)")
+    title = "Pareto: Test Top-1 vs Parameters"
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_accuracy_latency_scatter(lat_df):
+    # Only baseline/control/proposed (teacher has NaN accuracy)
+    plt.figure(figsize=(8, 6))
+    mapping = {
+        "Baseline (MobileNetV2)": "baseline",
+        "Control (Logits-KD)": "control",
+        "Proposed (KD+Bottleneck)": "proposed",
+    }
+    for _, row in lat_df.iterrows():
+        if row["model"] not in mapping:
+            continue
+        m = mapping[row["model"]]
+        plt.scatter(row["latency_ms"], row["top1_mean"], s=60, color=METHOD_COLOR[m], label=METHOD_LABEL[m])
+        plt.text(row["latency_ms"] + 0.02, row["top1_mean"], m, fontsize=10)
+
+    plt.xlabel("Latency (Milliseconds per Sample)")
+    plt.ylabel("Test Top-1 Accuracy (Mean Over Seeds)")
+    title = "Accuracy vs Inference Latency (CPU Micro-benchmark)"
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def plot_accuracy_latency_bars(lat_df):
+    # Dual-axis bars: Latency=purple, Accuracy=blue; legend in front (not hidden)
+    df = lat_df.copy()
+    x = np.arange(len(df))
+    w = 0.40
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.bar(x - w / 2, df["latency_ms"].values, width=w,
+            label="Latency (Ms Per Sample)", color=METRIC_COLOR["lat"], zorder=2)
+    ax1.set_ylabel("Latency (Ms Per Sample)")
+    ax1.set_xlabel("Model")
+    title = f"Accuracy And Inference Latency (Device Mode: {CONFIG['latency_device']})"
+    ax1.set_title(title)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df["model"].values, rotation=10)
+    ax1.grid(True, axis="y", zorder=0)
+
+    ax2 = ax1.twinx()
+    top1 = df["top1_mean"].values.astype(float)
+    top1_plot = np.nan_to_num(top1, nan=0.0)
+
+    bars2 = ax2.bar(x + w / 2, top1_plot, width=w,
+                    label="Test Top-1 (Mean)", color=METRIC_COLOR["acc"], alpha=0.9, zorder=2)
+    for i, v in enumerate(top1):
+        if not np.isfinite(v):
+            bars2[i].set_alpha(0.0)
+    ax2.set_ylabel("Test Top-1 Accuracy (Mean)")
+
+    ax2.patch.set_visible(False)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    leg = ax1.legend(h1 + h2, l1 + l2, loc="upper right", framealpha=0.95)
+    leg.set_zorder(1000)
+
+    plt.tight_layout()
+    if CONFIG["save_plots"]:
+        p = fig_path(title)
+        fig.savefig(p, dpi=200, bbox_inches="tight")
+        print(f"[Saved Figure] {p}")
+    plt.show()
+
+
+# =========================================================
+# Part 7 — Teacher Training Once + Caching
+# =========================================================
+def train_teacher_once_or_load():
+    t_path = os.path.join(CONFIG["results_dir"], CONFIG["teacher_weights_name"])
+
+    with STRATEGY.scope():
+        teacher = build_resnet50_logits_teacher(CONFIG["num_classes"])
+        teacher.compile(
+            optimizer=make_optimizer(),
+            loss=ce_loss_fn,
+            metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
+        )
+
+    if CONFIG["cache_teacher_weights"] and os.path.exists(t_path):
+        try:
+            teacher.load_weights(t_path)
+            print(f"Loaded Teacher Weights: {t_path}")
+            describe_model(teacher, "Teacher (ResNet50 Logits)")
+            return teacher
+        except Exception:
+            try:
+                os.remove(t_path)
+            except Exception:
+                pass
+
+    print("\n" + "=" * 90)
+    print("Training The Logits Teacher Once (20 Epochs, Backbone Frozen / Head-Only)")
+    print("=" * 90)
+
+    set_global_seed(CONFIG["split_seed"])
+    train_ds, val_ds, _ = make_datasets(run_seed=CONFIG["split_seed"])
+
+    saver = keras.callbacks.ModelCheckpoint(
+        filepath=t_path,
+        monitor="val_acc",
+        mode="max",
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1,
+    )
+
+    teacher.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=CONFIG["teacher_epochs"],
+        callbacks=[LRLogToHistory(), saver],
+        verbose=1,
+    )
+
+    teacher.load_weights(t_path)
+    print(f"Saved Teacher Weights: {t_path}")
+    describe_model(teacher, "Teacher (ResNet50 Logits)")
+    return teacher
+
+
+# =========================================================
+# Part 8 — Main Runner (2 Seeds)
+# =========================================================
+def run_main():
+    teacher_logits = train_teacher_once_or_load()
+
+    with STRATEGY.scope():
+        tmp_backbone = keras.applications.MobileNetV2(
+            include_top=False,
+            weights="imagenet" if CONFIG["student_imagenet_init"] else None,
+            input_shape=(*CONFIG["input_size"], 3),
+            alpha=float(CONFIG["student_alpha"]),
+        )
+        TAP_NAMES = choose_mobilenetv2_bottleneck_taps(tmp_backbone, CONFIG["tap_mode"], CONFIG["num_taps"])
+
+    print("Selected Bottleneck Taps:", TAP_NAMES)
+
+    with STRATEGY.scope():
+        feat_teacher = build_mobilenetv2_feature_teacher(TAP_NAMES)
+    describe_model(feat_teacher, "Feature Teacher (MobileNetV2 Taps, Frozen)")
+
+    beta_warmup_epochs = max(1, int(round(CONFIG["student_epochs"] * CONFIG["beta_warmup_frac"])))
+    alpha_warmup_epochs = max(1, int(round(CONFIG["student_epochs"] * CONFIG["alpha_warmup_frac"])))
+
+    print(f"Beta Max: {CONFIG['beta_max']} | Warmup epochs: {beta_warmup_epochs}")
+    print(f"Alpha Max: {CONFIG['alpha_kd']} | Warmup epochs: {alpha_warmup_epochs}")
+
+    hist = {m: {} for m in METHOD_ORDER}
+    times = {m: {} for m in METHOD_ORDER}
+    test_rows = []
+    calib_by_method = {m: [] for m in METHOD_ORDER}
+
+    rep_models = None
+
+    for seed in CONFIG["seeds"]:
+        print("\n" + "#" * 90)
+        print(f"Running Experiment (Seed {seed})")
+        print("#" * 90)
+
+        set_global_seed(seed)
+        train_ds, val_ds, test_ds = make_datasets(run_seed=seed)
+
+        with STRATEGY.scope():
+            template_student = StudentTapModel(
+                num_classes=CONFIG["num_classes"],
+                tap_layer_names=TAP_NAMES,
+                imagenet_init=CONFIG["student_imagenet_init"],
+                alpha=float(CONFIG["student_alpha"]),
+                freeze_bn=CONFIG["freeze_student_bn"],
+            )
+            _ = template_student(tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32), training=False)
+            template_weights = template_student.get_weights()
+
+        def fresh_student():
+            st = StudentTapModel(
+                num_classes=CONFIG["num_classes"],
+                tap_layer_names=TAP_NAMES,
+                imagenet_init=CONFIG["student_imagenet_init"],
+                alpha=float(CONFIG["student_alpha"]),
+                freeze_bn=CONFIG["freeze_student_bn"],
+            )
+            _ = st(tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32), training=False)
+            st.set_weights(template_weights)
+            return st
+
+        # ----------------------------
+        # Baseline
+        # ----------------------------
+        print("\n" + "=" * 80)
+        print(f"Baseline Training — Seed {seed}")
+
+        with STRATEGY.scope():
+            st_b = fresh_student()
+            b_logits = StudentLogitsOnly(st_b)
+            _ = b_logits(tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32), training=False)
+            b_logits.compile(
+                optimizer=make_optimizer(),
+                loss=ce_loss_fn,
+                metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
+            )
+
+        b_best = weights_path(f"student_baseline_best_seed{seed}")
+        b_time = TimeHistory()
+        b_saver = BestStudentSaver(b_logits, b_best, monitor="val_acc", mode="max")
+
+        h_b = b_logits.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CONFIG["student_epochs"],
+            callbacks=[b_time, LRLogToHistory(), b_saver],
+            verbose=1,
+        ).history
+
+        b_logits.load_weights(b_best)
+        b_top1, b_top5, b_nll = eval_test_metrics(b_logits, test_ds)
+
+        hist["baseline"][seed] = h_b
+        times["baseline"][seed] = b_time.times
+        test_rows.append({"seed": seed, "method": "baseline", "top1": b_top1, "top5": b_top5, "nll": b_nll, "best_path": b_best})
+
+        y_true, logits_b = collect_logits_and_labels(b_logits, test_ds)
+        probs_b = softmax_np(logits_b)
+        ba, bc, bf = reliability_bins(y_true, probs_b, n_bins=CONFIG["ece_bins"])
+        calib_by_method["baseline"].append({"seed": seed, "bin_acc": ba, "bin_conf": bc, "bin_frac": bf, "ece": ece_from_bins(ba, bc, bf)})
+
+        # ----------------------------
+        # Control (Logits-KD) with alpha warmup
+        # ----------------------------
+        print("\n" + "=" * 80)
+        print(f"Control Training — Seed {seed}")
+
+        with STRATEGY.scope():
+            st_c = fresh_student()
+            c_logits = StudentLogitsOnly(st_c)
+            _ = c_logits(tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32), training=False)
+
+            kd = LogitsKDDistiller(
+                student_logits_model=c_logits,
+                teacher_logits_model=teacher_logits,
+                temperature=CONFIG["temperature"],
+                alpha_max=CONFIG["alpha_kd"],
+                warmup_epochs=alpha_warmup_epochs,
+            )
+            kd.compile(optimizer=make_optimizer())
+
+        c_best = weights_path(f"student_control_best_seed{seed}")
+        c_time = TimeHistory()
+        c_saver = BestStudentSaver(c_logits, c_best, monitor="val_acc", mode="max")
+
+        h_c = kd.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CONFIG["student_epochs"],
+            callbacks=[c_time, LRLogToHistory(), EpochSetter(), c_saver],
+            verbose=1,
+        ).history
+
+        c_logits.load_weights(c_best)
+        c_top1, c_top5, c_nll = eval_test_metrics(c_logits, test_ds)
+
+        hist["control"][seed] = h_c
+        times["control"][seed] = c_time.times
+        test_rows.append({"seed": seed, "method": "control", "top1": c_top1, "top5": c_top5, "nll": c_nll, "best_path": c_best})
+
+        _, logits_c = collect_logits_and_labels(c_logits, test_ds)
+        probs_c = softmax_np(logits_c)
+        ca, cc, cf = reliability_bins(y_true, probs_c, n_bins=CONFIG["ece_bins"])
+        calib_by_method["control"].append({"seed": seed, "bin_acc": ca, "bin_conf": cc, "bin_frac": cf, "ece": ece_from_bins(ca, cc, cf)})
+
+        # ----------------------------
+        # Proposed (Dual-Teacher) with alpha + beta warmup
+        # ----------------------------
+        print("\n" + "=" * 80)
+        print(f"Proposed Training — Seed {seed}")
+
+        with STRATEGY.scope():
+            st_p = fresh_student()
+            prop = DualTeacherBottleneckDistiller(
+                student_tap=st_p,
+                logits_teacher=teacher_logits,
+                feat_teacher_taps=feat_teacher,
+                temperature=CONFIG["temperature"],
+                alpha_max=CONFIG["alpha_kd"],
+                alpha_warmup_epochs=alpha_warmup_epochs,
+                beta_max=CONFIG["beta_max"],
+                beta_warmup_epochs=beta_warmup_epochs,
+                adapters_on=CONFIG["adapters_on"],
+                feat_loss_type=CONFIG["feat_loss_type"],
+            )
+            prop.compile(optimizer=make_optimizer())
+
+        p_best = weights_path(f"student_proposed_best_seed{seed}")
+        p_time = TimeHistory()
+        p_saver = BestStudentSaver(prop.student_logits, p_best, monitor="val_acc", mode="max")
+
+        h_p = prop.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CONFIG["student_epochs"],
+            callbacks=[p_time, LRLogToHistory(), EpochSetter(), p_saver],
+            verbose=1,
+        ).history
+
+        prop.student_logits.load_weights(p_best)
+        p_top1, p_top5, p_nll = eval_test_metrics(prop.student_logits, test_ds)
+
+        hist["proposed"][seed] = h_p
+        times["proposed"][seed] = p_time.times
+        test_rows.append({"seed": seed, "method": "proposed", "top1": p_top1, "top5": p_top5, "nll": p_nll, "best_path": p_best})
+
+        _, logits_p = collect_logits_and_labels(prop.student_logits, test_ds)
+        probs_p = softmax_np(logits_p)
+        pa, pc, pf = reliability_bins(y_true, probs_p, n_bins=CONFIG["ece_bins"])
+        calib_by_method["proposed"].append({"seed": seed, "bin_acc": pa, "bin_conf": pc, "bin_frac": pf, "ece": ece_from_bins(pa, pc, pf)})
+
+        if rep_models is None and seed == CONFIG["ablation_seed"]:
+            rep_models = {
+                "teacher": teacher_logits,
+                "baseline": b_logits,
+                "control": c_logits,
+                "proposed": prop.student_logits,
+            }
+
+    # ============================
+    # Tables
+    # ============================
+    test_df = pd.DataFrame(test_rows)
+
+    print("\n" + "=" * 90)
+    print("Per-Seed Test Results (Best Checkpoints)")
+    print("=" * 90)
+    print(test_df[["seed", "method", "top1", "top5", "nll", "best_path"]].to_string(index=False))
+    save_df(test_df[["seed", "method", "top1", "top5", "nll", "best_path"]], "test_per_seed_full")
+
+    summary = test_df.groupby("method")[["top1", "top5"]].agg(["mean", "std"])
+    summary_flat = summary.copy()
+    summary_flat.columns = ["_".join(c) for c in summary_flat.columns]
+    summary_flat = summary_flat.reset_index()
+    print("\nMean ± Std Across Seeds:")
+    print(summary.to_string())
+    save_df(summary_flat, "test_mean_std")
+
+    # ECE table
+    ece_rows = []
+    for m in METHOD_ORDER:
+        eces = np.array([r["ece"] for r in calib_by_method[m]], dtype=np.float32)
+        ece_rows.append({"method": METHOD_LABEL[m], "ECE_mean": float(eces.mean()), "ECE_std": float(eces.std(ddof=0))})
+    ece_df = pd.DataFrame(ece_rows)
+    print("\nECE (Mean ± Std Across Seeds):")
+    print(ece_df.to_string(index=False))
+    save_df(ece_df, "ece_mean_std")
+
+    # ============================
+    # Plots: Per-seed
+    # ============================
+    for seed in CONFIG["seeds"]:
+        plot_validation_accuracy_by_seed(hist, seed)
+        plot_validation_nll_by_seed(hist, seed)
+        plot_convergence_speed_by_seed(hist, times, seed)
+        plot_test_accuracy_bars_by_seed(test_df, seed)
+        plot_test_nll_bars_by_seed(test_df, seed)
+
+    # ============================
+    # Plots: Across seeds
+    # ============================
+    plot_val_acc_mean_std(hist)
+    plot_val_acc_vs_time_mean_std(hist, times)
+    plot_test_accuracy_mean_std(test_df)
+    plot_calibration_curve_and_print_ece(calib_by_method)
+
+    # ============================
+    # Pareto + Latency
+    # ============================
+    if rep_models is not None:
+        top1_mean = test_df.groupby("method")["top1"].mean().to_dict()
+
+        pareto_df = pd.DataFrame([
+            {"model": "Baseline (MobileNetV2)", "params": count_params(rep_models["baseline"]), "top1_mean": float(top1_mean["baseline"])},
+            {"model": "Control (Logits-KD)", "params": count_params(rep_models["control"]), "top1_mean": float(top1_mean["control"])},
+            {"model": "Proposed (KD+Bottleneck)", "params": count_params(rep_models["proposed"]), "top1_mean": float(top1_mean["proposed"])},
+        ])
+        print("\nPareto Table (Parameters, Top-1 Mean):")
+        print(pareto_df.to_string(index=False))
+        save_df(pareto_df, "pareto_params_top1_mean")
+
+        plot_model_size_bars(pareto_df)
+        plot_top1_mean_bars(pareto_df)
+        plot_pareto_scatter_params(pareto_df)
+
+        dev = CONFIG["latency_device"]
+        print("\nBenchmarking latency on CPU (micro-benchmark, ms/sample)...")
+
+        lat_rows = []
+        t_lat = benchmark_latency_ms(rep_models["teacher"], dev, CONFIG["lat_batch_size"], CONFIG["lat_warmup"], CONFIG["lat_iters_teacher"])
+        lat_rows.append({"model": "Teacher (ResNet50)", "latency_ms": t_lat, "top1_mean": np.nan})
+
+        for method, label in [
+            ("baseline", "Baseline (MobileNetV2)"),
+            ("control", "Control (Logits-KD)"),
+            ("proposed", "Proposed (KD+Bottleneck)"),
+        ]:
+            lat = benchmark_latency_ms(rep_models[method], dev, CONFIG["lat_batch_size"], CONFIG["lat_warmup"], CONFIG["lat_iters_student"])
+            lat_rows.append({"model": label, "latency_ms": lat, "top1_mean": float(top1_mean[method])})
+
+        lat_df = pd.DataFrame(lat_rows)
+        print(f"\nLatency Table (Device Mode={dev}):")
+        print(lat_df.to_string(index=False))
+        save_df(lat_df, "latency_table")
+
+        plot_accuracy_latency_bars(lat_df)
+        plot_accuracy_latency_scatter(lat_df)
+
+    print("\nSaved outputs under:", CONFIG["results_dir"])
+    return TAP_NAMES, teacher_logits
+
+
+# =========================================================
+# Part 9 — Ablations
+# =========================================================
+def plot_ablation_study_bars(ab_df, seed=0):
+    desired_order = ["Proposed (Full)", "Proposed (Adapters Off)", "Proposed (Plain MSE)"]
+    order = [v for v in desired_order if v in set(ab_df["variant"].tolist())]
+    order += [v for v in ab_df["variant"].tolist() if v not in order]
+    ab = ab_df.set_index("variant").loc[order].reset_index()
+
+    variants = ab["variant"].tolist()
+    x = np.arange(len(variants))
+    w = 0.25
+
+    nll = ab["nll"].astype(float).to_numpy()
+    nll_score = np.full_like(nll, np.nan, dtype=float)
+    finite = np.isfinite(nll)
+    if np.any(finite):
+        nll_min = np.min(nll[finite])
+        nll_max = np.max(nll[finite])
+        if abs(nll_max - nll_min) < 1e-12:
+            nll_score[finite] = 0.5
+        else:
+            nll_norm = (nll[finite] - nll_min) / (nll_max - nll_min)
+            nll_score[finite] = 1.0 - nll_norm
+
+    plt.figure(figsize=(8, 6))
+    plt.bar(x - w, ab["top1"].to_numpy(), width=w, label="Top-1 Accuracy", color=METRIC_COLOR["top1"])
+    plt.bar(x, ab["top5"].to_numpy(), width=w, label="Top-5 Accuracy", color=METRIC_COLOR["top5"])
+
+    green_heights = np.nan_to_num(nll_score, nan=0.0)
+    green_bars = plt.bar(x + w, green_heights, width=w, label="Normalized NLL Score (Higher Is Better)", color="tab:green")
+    for i, ok in enumerate(np.isfinite(nll_score)):
+        if not ok:
+            green_bars[i].set_alpha(0.0)
+
+    plt.xticks(x, variants, rotation=10)
+    plt.ylabel("Score")
+    title = f"Ablation Study (Seed {seed}): Accuracy And Normalized NLL"
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    save_current_fig(title)
+    plt.show()
+
+
+def run_ablations(TAP_NAMES, teacher_logits):
+    if not CONFIG["run_ablations"]:
+        return
+
+    seed = CONFIG["ablation_seed"]
+    print("\n" + "=" * 90)
+    print(f"Running Ablations (Single Seed {seed}; 20 Epochs Each)")
+    print("=" * 90)
+
+    set_global_seed(seed)
+    train_ds, val_ds, test_ds = make_datasets(run_seed=seed)
+
+    with STRATEGY.scope():
+        feat_teacher = build_mobilenetv2_feature_teacher(TAP_NAMES)
+
+    beta_warmup_epochs = max(1, int(round(CONFIG["student_epochs"] * CONFIG["beta_warmup_frac"])))
+    alpha_warmup_epochs = max(1, int(round(CONFIG["student_epochs"] * CONFIG["alpha_warmup_frac"])))
+
+    variants = [
+        ("Proposed (Full)", True, "norm_mse"),
+        ("Proposed (Adapters Off)", False, "norm_mse"),
+        ("Proposed (Plain MSE)", True, "mse"),
+    ]
+
+    rows = []
+    for tag, adapters_on, feat_loss_type in variants:
+        print("\n" + "-" * 80)
+        print(f"Ablation Variant: {tag}")
+
+        with STRATEGY.scope():
+            st = StudentTapModel(
+                num_classes=CONFIG["num_classes"],
+                tap_layer_names=TAP_NAMES,
+                imagenet_init=CONFIG["student_imagenet_init"],
+                alpha=float(CONFIG["student_alpha"]),
+                freeze_bn=CONFIG["freeze_student_bn"],
+            )
+            _ = st(tf.zeros((1, *CONFIG["input_size"], 3), dtype=tf.float32), training=False)
+
+            dist = DualTeacherBottleneckDistiller(
+                student_tap=st,
+                logits_teacher=teacher_logits,
+                feat_teacher_taps=feat_teacher,
+                temperature=CONFIG["temperature"],
+                alpha_max=CONFIG["alpha_kd"],
+                alpha_warmup_epochs=alpha_warmup_epochs,
+                beta_max=CONFIG["beta_max"],
+                beta_warmup_epochs=beta_warmup_epochs,
+                adapters_on=adapters_on,
+                feat_loss_type=feat_loss_type,
+            )
+            dist.compile(optimizer=make_optimizer())
+
+        best_path = weights_path(f"ablation_{slugify(tag)}_best_seed{seed}")
+        saver = BestStudentSaver(dist.student_logits, best_path, monitor="val_acc", mode="max")
+
+        dist.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CONFIG["student_epochs"],
+            callbacks=[LRLogToHistory(), EpochSetter(), saver],
+            verbose=1,
+        )
+
+        dist.student_logits.load_weights(best_path)
+        top1, top5, nll = eval_test_metrics(dist.student_logits, test_ds)
+        rows.append({"variant": tag, "top1": top1, "top5": top5, "nll": nll, "best_path": best_path})
+
+    ab_df = pd.DataFrame(rows)
+    print("\n" + "=" * 90)
+    print("Ablation Results (Single Seed)")
+    print("=" * 90)
+    print(ab_df.to_string(index=False))
+    save_df(ab_df, "ablation_results")
+
+    plot_ablation_study_bars(ab_df, seed=seed)
+
+
+# =========================================================
+# RUN
+# =========================================================
+TAP_NAMES, TEACHER = run_main()
+run_ablations(TAP_NAMES, TEACHER)
+
+if CONFIG["zip_artifacts"]:
+    zip_base = os.path.join(CONFIG["results_dir"], "artifacts")
+    zip_path = shutil.make_archive(zip_base, "zip", CONFIG["results_dir"])
+    print(f"\n[Zipped Artifacts] {zip_path}")
